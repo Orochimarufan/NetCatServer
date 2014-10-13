@@ -30,9 +30,16 @@
 		</Build>
 		<Compiler>
 			<Add option="-Weverything" />
+			<Add option="-std=c++11" />
 			<Add option="-fexceptions" />
+			<Add option="-Wno-c++98-compat" />
 		</Compiler>
+		<Unit filename="cmdparser.cpp" />
+		<Unit filename="cmdparser.h" />
+		<Unit filename="cmdparser_p.h" />
 		<Unit filename="main.cpp" />
+		<Unit filename="sd-daemon.cpp" />
+		<Unit filename="sd-daemon.h" />
 		<Extensions>
 			<code_completion />
 			<envvars />

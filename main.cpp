@@ -27,11 +27,9 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <unistd.h>
-#include <errno.h>
 #include <fcntl.h>
 
 #include <iostream>
-
 #include <cstring>
 #include <string>
 #include <algorithm>
@@ -40,6 +38,8 @@
 #include <array>
 #include <memory>
 #include <sstream>
+#include <cerrno>
+#include <ctime>
 
 #include "cmdparser.h"
 #include "sd-daemon.h"
@@ -51,11 +51,8 @@ using namespace std;
 #define PASS_OUT 2
 #define PASS_ERR 4
 
-CmdParser::ArgumentMap parse_argv(int argc, const std::vector<std::string> &exec_args);
-void exec_pass_fd(int fd, int pass, char **exec_argv);
-
-
-CmdParser::ArgumentMap parse_argv(int argc, char **argv)
+// Parse Commandline Options
+static CmdParser::ArgumentMap parse_argv(int argc, char **argv)
 {
     CmdParser::Parser parser;
     CmdParser::ArgumentMap args;
@@ -116,29 +113,47 @@ CmdParser::ArgumentMap parse_argv(int argc, char **argv)
     return args;
 }
 
+// Handle sockaddr structs
 union sockaddr_inet {
     short family;
     sockaddr_in in;
     sockaddr_in6 in6;
 };
 
-char *peername(const sockaddr_inet &peer)
+static char *peername(const sockaddr_inet &peer)
 {
     static char straddr[INET6_ADDRSTRLEN+3] = "[";
 
-        inet_ntop(peer.family, &peer.in.sin_addr, straddr+1, sizeof(straddr-1));
+    inet_ntop(peer.family, &peer.in.sin_addr, straddr+1, sizeof(straddr)-2);
 
-        if (peer.family == AF_INET6)
-        {
-            strncpy(straddr + strlen(straddr), "]", 2);
-            return straddr;
-        }
-        else
-            return straddr+1;
+    if (peer.family == AF_INET6)
+    {
+        strncpy(straddr + strlen(straddr), "]", 2);
+        return straddr;
+    }
+    else
+        return straddr+1;
 }
 
+static std::string int2s(int i)
+{
+    std::ostringstream os;
+    os << i;
+    return os.str();
+}
+
+// Represents a Client process
 struct Client
 {
+    // Members
+    int fd;
+    sockaddr_inet peer;
+    int pass;
+    const std::vector<std::string> &exec_argv;
+    std::vector<char*> argv;
+
+    // -------------------------------------------------------------------
+    // Accept a new client
     static std::unique_ptr<Client> accept(int fd, int pass, const std::vector<std::string> &exec_argv)
     {
         sockaddr_inet sa;
@@ -151,51 +166,61 @@ struct Client
         return std::unique_ptr<Client>(new Client(sock, sa, pass, exec_argv));
     }
 
-    int fd;
-    sockaddr_inet peer;
-    int pass;
-    const std::vector<std::string> &exec_argv;
-    std::vector<char*> argv;
+    Client(int client_fd, const sockaddr_inet &client_peer, int client_pass_stdstreams, const std::vector<std::string> &client_exec_argv) :
+        fd(client_fd), peer(client_peer),  pass(client_pass_stdstreams), exec_argv(client_exec_argv)
+    {
+    }
 
+    // -------------------------------------------------------------------
+    // Get the client's name (IP address) and port
     char *peername()
     {
         return ::peername(peer);
     }
 
-    Client(int fd, const sockaddr_inet &peer, int pass, const std::vector<std::string> &exec_argv) :
-        fd(fd), peer(peer),  pass(pass), exec_argv(exec_argv)
+    uint16_t port()
     {
+        return ntohs(peer.in.sin_port);
     }
 
+    // -------------------------------------------------------------------
+    // Start/Fork the client process
     int start()
     {
         int pid;
+
         if ((pid = fork()) != 0)
             return pid;
 
         run();
-        exit(0);
     }
 
-    // Replace vars
-    static std::regex re;
-
+    // -------------------------------------------------------------------
+    // Handle the Client process argv
+    // NOTE: Memory leaks aren't a problem because we'll be exec()ing soon anyway
     template <typename T>
     std::string ref_var(const T &var)
     {
-        if (var[1] == "a")
+        // This is where the variables are defined.
+        if (var[1] == "h") // Peer hostname
             return peername();
-        if (var[1] == "p")
+        if (var[1] == "p") // Peer port
+            return int2s(port());
+        if (var[1] == "i") // PID
+            return int2s(getpid());
+        if (var[1] == "t") // Connection time
         {
-            std::ostringstream s;
-            s << getpid();
-            return s.str();
+            // We pretend now == connection time^^
+            std::time_t t(std::time(NULL));
+            return std::ctime(&t);
         }
         return var.str();
     }
 
     char *regex_replace_var(const std::string &str)
     {
+        static std::regex re("\\%([^\\%])");
+
         auto i = std::sregex_iterator(str.begin(), str.end(), re);
         auto i_end = decltype(i)();
         auto last_i = i;
@@ -206,13 +231,13 @@ struct Client
         std::string res;
         for (; i != i_end; ++i)
         {
-            //std::copy(i->prefix().first, i->prefix().second, res);
-            res += i->prefix().str();
+            res.reserve(res.size() + i->prefix().length());
+            std::copy(i->prefix().first, i->prefix().second, std::back_inserter(res));
             res += ref_var(*i);
             last_i = i;
         }
-        //std::copy(last_i->suffix().first, last_i->suffix().second, res);
-        res += last_i->suffix().str();
+        res.reserve(res.size() + last_i->suffix().length());
+        std::copy(last_i->suffix().first, last_i->suffix().second, std::back_inserter(res));
 
         char *ret = new char[res.size() + 1];
         std::strncpy(ret, res.c_str(), res.size() + 1);
@@ -228,6 +253,8 @@ struct Client
         argv.push_back(NULL);
     }
 
+    // -------------------------------------------------------------------
+    // Execute the client process
     void __attribute__((noreturn)) run()
     {
         prepare_argv();
@@ -261,12 +288,10 @@ struct Client
     }
 };
 
-std::regex Client::re("\\%([^\\%])");
+static int sock_fd = -1;
+static std::unordered_map<int, std::unique_ptr<Client>> pid_map;
 
-int sock_fd = -1;
-std::unordered_map<int, std::unique_ptr<Client>> pid_map;
-
-void sigint_handler(int)
+static void __attribute__((noreturn)) sigint_handler(int)
 {
     cerr << "\033[31mCaught SIGINT. Shutting down.\033[0m" << endl;
     if (sock_fd >= 0)
@@ -277,7 +302,7 @@ void sigint_handler(int)
     exit(2);
 }
 
-void sigchld_handler(int, siginfo_t *si, void *)
+static void sigchld_handler(int, siginfo_t *si, void *)
 {
     auto it = pid_map.find(si->si_pid);
     if (it == pid_map.end())
@@ -348,7 +373,7 @@ int main(int argc, char **argv)
         {
             addr.family = AF_INET6;
             addr.in6.sin6_addr = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
-            addr.in6.sin6_port = htons((unsigned)args["port"].toNumber());
+            addr.in6.sin6_port = {htons(static_cast<uint16_t>(args["port"].toNumber()))};
             if (!addrs.empty())
                 inet_pton(AF_INET6, addrs.c_str(), &addr.in6.sin6_addr);
         }
@@ -356,7 +381,7 @@ int main(int argc, char **argv)
         {
             addr.in.sin_family = AF_INET;
             addr.in.sin_addr.s_addr = htonl(INADDR_ANY);
-            addr.in.sin_port = htons((unsigned)args["port"].toNumber());
+            addr.in.sin_port = htons(static_cast<uint16_t>(args["port"].toNumber()));
             if (!addrs.empty())
                 inet_pton(AF_INET, addrs.c_str(), &addr.in.sin_addr);
         }
@@ -419,7 +444,7 @@ int main(int argc, char **argv)
             continue;
         }
 
-        cerr << "\033[36mConnected: \033[35m" << client->peername() << "\033[0m";
+        cerr << "\033[36mConnected: \033[35m" << client->peername() << ":" << client->port() << "\033[0m";
 
         int pid = client->start();
 
